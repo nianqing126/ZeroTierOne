@@ -1,0 +1,129 @@
+# 放到仓库的 .github/workflows/openwrt-zerotier.yml（dev 分支）
+# 编译目标：ARM Cortex-A53（64 位 aarch64_cortex-a53），同时产出 .ipk 与 .apk
+#
+# 产物说明：
+#   OpenWrt 24.10.x  ->  zerotier_*.ipk  （opkg 安装）
+#   OpenWrt 25.12.x  ->  zerotier-*.apk  （apk 安装，需 --allow-untrusted）
+#
+# 触发方式：Actions 页面手动 Run workflow（可选 target，默认 mediatek/filogic）
+# zerotier 是纯用户态包，aarch64_cortex-a53 架构的包可装在所有 A53 64 位设备上
+# （MT7981/MT7986 filogic、RK3328、树莓派3 bcm2710 等），不限于所选 SDK 的具体机型。
+
+name: Build ZeroTier for OpenWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "target/subtarget（决定包架构：aarch64_cortex-a53 用 mediatek/filogic；aarch64_generic 用 armsr/armv8）"
+        required: true
+        default: "mediatek/filogic"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-zerotier-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 24.10 -> ipk | 25.12 -> apk，两条腿同时跑
+        ow: [ "24.10.8", "25.12.6" ]
+
+    env:
+      TS: ${{ github.event.inputs.target || 'mediatek/filogic' }}
+
+    steps:
+      - name: Checkout（本仓库 = ZeroTier 源码）
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gawk gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync swig unzip wget xz-utils zstd file
+
+      - name: 解析 target / subtarget
+        run: |
+          TARGET="${TS%%/*}"
+          SUBTARGET="${TS##*/}"
+          echo "TARGET=$TARGET"    >> $GITHUB_ENV
+          echo "SUBTARGET=$SUBTARGET" >> $GITHUB_ENV
+          echo "构建目标: $TARGET/$SUBTARGET (OpenWrt ${{ matrix.ow }})"
+
+      - name: 下载 OpenWrt SDK ${{ matrix.ow }}
+        run: |
+          set -e
+          BASE="https://downloads.openwrt.org/releases/${{ matrix.ow }}/targets/${TARGET}/${SUBTARGET}"
+          # 从 sha256sums 清单里找 SDK 文件名，避免硬编码 gcc 版本
+          SDK=$(curl -sL "$BASE/sha256sums" | awk '{print $2}' | grep -E '^openwrt-sdk-.*Linux-x86_64\.tar\.zst$' | head -1)
+          if [ -z "$SDK" ]; then
+            echo "::error::在 $BASE 找不到 SDK，请检查 OpenWrt 版本与 target/subtarget 是否匹配"
+            exit 1
+          fi
+          echo "SDK = $SDK"
+          curl -sL --retry 3 -o /tmp/sdk.tar.zst "$BASE/$SDK"
+          mkdir -p "$HOME/sdk"
+          tar -I zstd -xf /tmp/sdk.tar.zst -C "$HOME/sdk" --strip-components=1
+
+      - name: 准备 feeds，用官方包定义 + 本仓库源码
+        run: |
+          set -e
+          cd "$HOME/sdk"
+          ./scripts/feeds update packages
+          ./scripts/feeds install -a
+          # 删掉 feeds 里的官方 zerotier，换成指向本 fork 的定义
+          rm -rf package/feeds/zerotier
+          cp -r feeds/packages/net/zerotier package/zerotier
+
+          # 从源码 include/version.hpp 读取真实版本号（读不到则退回 0.0.0）
+          ZT_VER=$(grep -oE 'ZEROTIER_ONE_VERSION_(MAJOR|MINOR|REVISION)[[:space:]]+[0-9]+' \
+                     "$GITHUB_WORKSPACE/include/version.hpp" \
+                   | grep -oE '[0-9]+' | paste -sd. -)
+          ZT_VER=${ZT_VER:-0.0.0}
+          SHA7=${GITHUB_SHA::7}
+          echo "ZeroTier 版本: $ZT_VER (commit $SHA7)"
+
+          # 三处替换：版本号 / 源码指向本仓库当前 commit / 跳过哈希校验
+          sed -i "s|^PKG_VERSION:=.*|PKG_VERSION:=${ZT_VER}-g${SHA7}|" package/zerotier/Makefile
+          sed -i "s|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=https://codeload.github.com/${GITHUB_REPOSITORY}/tar.gz/${GITHUB_SHA}?|" package/zerotier/Makefile
+          sed -i "/^PKG_HASH:=/d" package/zerotier/Makefile
+          sed -i "/^PKG_SOURCE_URL:=/a PKG_HASH:=skip" package/zerotier/Makefile
+
+      - name: 编译 zerotier
+        run: |
+          set -e
+          cd "$HOME/sdk"
+          echo "CONFIG_PACKAGE_zerotier=m" >> .config
+          # 需要 LuCI 界面的话再追加：echo "CONFIG_PACKAGE_luci-app-zerotier=m" >> .config
+          make defconfig
+          make -j"$(nproc)" package/zerotier/compile || make -j1 V=s package/zerotier/compile
+
+      - name: 收集产物
+        run: |
+          set -e
+          cd "$HOME/sdk"
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          find bin/packages -name 'zerotier*' \( -name '*.ipk' -o -name '*.apk' \) \
+            -exec cp -v {} "$OUT/" \;
+          echo "================ 产物列表 ================"
+          ls -lh "$OUT"
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerotier_openwrt-${{ matrix.ow }}_${{ env.TARGET }}-${{ env.SUBTARGET }}
+          path: out/*
+          if-no-files-found: error
