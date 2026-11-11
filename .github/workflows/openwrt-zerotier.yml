@@ -49,10 +49,20 @@ jobs:
 
       - name: 安装编译依赖
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential gawk gettext git libncurses-dev libssl-dev \
-            python3 python3-setuptools rsync swig unzip wget xz-utils zstd file
+          set -e
+          # ubuntu-latest 已预装 gcc/g++/make/git/wget/unzip/xz/python3，
+          # 这里只补可能缺的；apt 偶发 DNS 失败（security.ubuntu.com 解析超时）时重试，
+          # 仍失败则跳过——预装工具足够完成本构建。
+          for i in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 update; then break; fi
+            echo "apt update 失败，第 $i 次重试..."; sleep 15
+          done
+          sudo apt-get install -y --no-install-recommends zstd file gawk gettext \
+            || echo "::warning::apt 安装失败，继续使用 runner 预装工具"
+
+          for c in gcc g++ make git wget tar xz zstd python3; do
+            command -v "$c" >/dev/null 2>&1 || { echo "::error::缺少命令 $c"; exit 1; }
+          done
 
       - name: 解析 target / subtarget
         run: |
